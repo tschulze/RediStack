@@ -194,7 +194,8 @@ extension RedisConnection {
         message.append(contentsOf: arguments)
         
         let promise = channel.eventLoop.makePromise(of: RESPValue.self)
-        let command = RedisCommand(
+        let promiseCluster = channel.eventLoop.makePromise(of: RESPValue.self)
+        let redisCommand = RedisCommand(
             message: .array(message),
             responsePromise: promise
         )
@@ -205,21 +206,51 @@ extension RedisConnection {
             RedisMetrics.commandRoundTripTime.recordNanoseconds(duration)
             
             // log the error here instead
-            guard case let .failure(error) = result else {
+            switch result {
+            case .success(let value):
+                promiseCluster.succeed(value)
                 self.logger.trace("Command completed.")
-                return
+            case .failure(let error):
+                if error.localizedDescription.contains("MOVED") {
+                    guard let ipPort = error.localizedDescription.components(separatedBy: .whitespaces)
+                        .last?
+                        .components(separatedBy: ":") else {
+
+                            promiseCluster.fail(error)
+                            return
+                    }
+                    guard let ip = ipPort.first,
+                        let portStr = ipPort.last,
+                        let port = Int(portStr) else {
+
+                            promiseCluster.fail(error)
+                            return
+                    }
+                    do {
+                        _ = RedisConnection.connect(to: try .makeAddressResolvingHost(ip, port: port),
+                                                    on: self.channel.eventLoop)
+                            .map { $0.send(command: command, with: arguments).map { promiseCluster.succeed($0) }}
+                    } catch let error {
+                        promiseCluster.fail(error)
+                    }
+                } else {
+                    self.logger.error("\(error.localizedDescription)")
+                }
             }
-            self.logger.error("\(error.localizedDescription)")
         }
         
-        self.logger.debug("Sending command \"\(command)\"\(arguments.count > 0 ? " with \(arguments)" : "")")
+        self.logger.debug("Sending command \"\(redisCommand)\"\(arguments.count > 0 ? " with \(arguments)" : "")")
         
         defer { self.logger.trace("Command sent through channel.") }
 
         if self.sendCommandsImmediately {
-            return channel.writeAndFlush(command).flatMap { promise.futureResult }
+            return channel.writeAndFlush(redisCommand).and(promiseCluster.futureResult).flatMap { _ in
+                promiseCluster.futureResult
+            }
         } else {
-            return channel.write(command).flatMap { promise.futureResult }
+            return channel.write(redisCommand).and(promiseCluster.futureResult).flatMap { _ in
+                promiseCluster.futureResult
+            }
         }
     }
 }
